@@ -47,9 +47,7 @@ function loadSubmissions() {
     if (Array.isArray(arr)) {
       submissions = arr;
       arr.forEach(s => {
-        if (typeof s.id === 'number' && s.id > submissionCounter) {
-          submissionCounter = s.id;
-        }
+        if (typeof s.id === 'number' && s.id > submissionCounter) submissionCounter = s.id;
       });
       console.log(`[Postboard] Loaded ${submissions.length} submission(s)`);
     }
@@ -70,7 +68,59 @@ function saveSubmissions() {
 
 loadSubmissions();
 
-// ---------- public-server/index.html (the big UI) ----------
+// ---------- Seen-UUIDs persistence ----------
+const SEEN_UUIDS_PATH = path.join(__dirname, 'seen_uuids.json');
+let seenUUIDs = [];                 // array of { uuid, firstSeen, lastSeen }
+let seenUUIDsMap = new Map();       // uuid -> entry
+
+function loadSeenUUIDs() {
+  try {
+    if (!fs.existsSync(SEEN_UUIDS_PATH)) return;
+    const raw = fs.readFileSync(SEEN_UUIDS_PATH, 'utf8');
+    const arr = JSON.parse(raw);
+    if (Array.isArray(arr)) {
+      seenUUIDs = arr.filter(e => e && typeof e.uuid === 'string');
+      seenUUIDsMap = new Map();
+      seenUUIDs.forEach(e => seenUUIDsMap.set(e.uuid, e));
+      console.log(`[Seen] Loaded ${seenUUIDs.length} seen UUID(s)`);
+    }
+  } catch (err) {
+    console.error('[Seen] Failed to load:', err.message);
+  }
+}
+
+function saveSeenUUIDs() {
+  try {
+    const tmp = SEEN_UUIDS_PATH + '.tmp';
+    fs.writeFileSync(tmp, JSON.stringify(seenUUIDs, null, 2));
+    fs.renameSync(tmp, SEEN_UUIDS_PATH);
+  } catch (err) {
+    console.error('[Seen] Failed to save:', err.message);
+  }
+}
+
+function markUUIDSeen(uuid) {
+  if (!uuid || typeof uuid !== 'string') return;
+  const now = Date.now();
+  const existing = seenUUIDsMap.get(uuid);
+  if (existing) {
+    // Only persist lastSeen changes at most once per minute to reduce disk writes
+    const shouldSave = (now - existing.lastSeen) > 60000;
+    existing.lastSeen = now;
+    if (shouldSave) saveSeenUUIDs();
+  } else {
+    const entry = { uuid, firstSeen: now, lastSeen: now };
+    seenUUIDs.push(entry);
+    seenUUIDsMap.set(uuid, entry);
+    saveSeenUUIDs();
+  }
+}
+
+loadSeenUUIDs();
+
+// =====================================================
+// ============== public-server/index.html =============
+// =====================================================
 const publicDir = path.join(__dirname, 'public-server');
 if (!fs.existsSync(publicDir)) fs.mkdirSync(publicDir, { recursive: true });
 
@@ -85,89 +135,6 @@ const indexHtml = `<!DOCTYPE html>
     html, body { height: 100%; background: #121212; color: #eee; font-family: 'Courier New', monospace; }
     body { display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
 
-    /* ================= POSTBOARD (top bar + panel) ================= */
-    #postboardBar {
-      flex: 0 0 auto;
-      background: #1a1a1a;
-      border-bottom: 1px solid #333;
-      padding: 8px 15px;
-      display: flex;
-      gap: 8px;
-      align-items: center;
-      z-index: 1500;
-    }
-    #postboardBar input {
-      flex: 1;
-      background: #0a0a0a;
-      border: 1px solid #333;
-      color: #eee;
-      padding: 6px 10px;
-      border-radius: 4px;
-      font-family: 'Courier New', monospace;
-      font-size: 12px;
-    }
-    #postboardBar input:focus { outline: 1px solid #0f08; }
-    #postboardBar button {
-      background: #2a2a2a;
-      color: #eee;
-      border: 1px solid #333;
-      padding: 6px 10px;
-      border-radius: 4px;
-      cursor: pointer;
-      font-family: 'Courier New', monospace;
-      font-size: 11px;
-      white-space: nowrap;
-    }
-    #postboardBar button:hover { background: #3a3a3a; }
-    #postboardBar .badge {
-      background: #0f02;
-      color: #5f5;
-      border: 1px solid #0f08;
-      padding: 3px 6px;
-      border-radius: 3px;
-      font-size: 10px;
-      font-weight: bold;
-      white-space: nowrap;
-    }
-
-    #postboardPanel {
-      flex: 0 0 auto;
-      max-height: 30vh;
-      overflow-y: auto;
-      background: #161616;
-      border-bottom: 1px solid #333;
-      padding: 8px 15px;
-      display: none;
-    }
-    #postboardPanel.visible { display: block; }
-
-    .submission-item {
-      border: 1px solid #2a2a2a;
-      border-radius: 4px;
-      margin-bottom: 8px;
-      padding: 8px;
-      background: #0d0d0d;
-    }
-    .submission-header {
-      color: #5f5;
-      font-size: 11px;
-      margin-bottom: 4px;
-      word-break: break-all;
-    }
-    .submission-body {
-      color: #ddd;
-      font-size: 11px;
-      white-space: pre-wrap;
-      word-break: break-all;
-      max-height: 200px;
-      overflow-y: auto;
-      background: #050505;
-      padding: 4px;
-      border-radius: 3px;
-    }
-    .submission-empty { color: #888; font-size: 12px; }
-
-    /* ================= TERMINAL ================= */
     #terminal {
       flex: 1 1 auto;
       min-height: 0;
@@ -193,7 +160,6 @@ const indexHtml = `<!DOCTYPE html>
     }
     #cmd:focus { outline: none; }
 
-    /* ================= existing terminal styling ================= */
     .output { margin: 2px 0; display: flex; gap: 8px; align-items: flex-start; }
     .error { color: #f55; }
     .system { color: #3af; }
@@ -229,7 +195,6 @@ const indexHtml = `<!DOCTYPE html>
     .selectedInfo { color: #888; font-size: 10px; }
     .line-highlight { background: #ffffff08; }
 
-    /* file transfer */
     #fileSection { border-bottom: 1px solid #333; padding-bottom: 6px; margin-bottom: 2px; }
     .file-label { color: #aaa; font-size: 10px; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 3px; }
     .file-row { display: flex; gap: 4px; align-items: center; margin-bottom: 4px; }
@@ -248,24 +213,8 @@ const indexHtml = `<!DOCTYPE html>
   </style>
 </head>
 <body>
-
-  <!-- ================= POSTBOARD TOP BAR ================= -->
-  <div id="postboardBar">
-    <input id="postboardSearch" type="text"
-           placeholder="Search submissions by client UUID (leave empty for all)…"
-           autocomplete="off" spellcheck="false" />
-    <button id="postboardSearchBtn">Search</button>
-    <button id="postboardToggleBtn">Hide Postboard</button>
-    <span class="badge" id="postboardCount">0</span>
-  </div>
-  <div id="postboardPanel" class="visible">
-    <div id="postboardList"><div class="submission-empty">Loading…</div></div>
-  </div>
-
-  <!-- ================= TERMINAL ================= -->
   <div id="terminal"></div>
 
-  <!-- ================= RIGHT CONTROL BAR ================= -->
   <div id="controlBar" title="Selection & File Controls">
     <div id="fileSection">
       <div class="file-label">Upload File to Client(s)</div><br>
@@ -292,28 +241,18 @@ const indexHtml = `<!DOCTYPE html>
     <button id="clearBtn">Clear Selections</button>
   </div>
 
-  <!-- ================= FILE PROGRESS OVERLAY ================= -->
   <div id="fileProgress">
     <div class="progress-label" id="progressLabel">Transferring...</div>
     <div class="progress-bar-bg"><div class="progress-bar-fill" id="progressFill"></div></div>
     <div class="progress-pct" id="progressPct">0%</div>
   </div>
 
-  <!-- ================= COMMAND INPUT ================= -->
   <div id="inputLine">
     <input type="text" id="cmd" autocomplete="off" spellcheck="false" placeholder="Type command..." autofocus />
   </div>
 
   <script src="/socket.io/socket.io.js"></script>
   <script>
-    // ---------- hide postboard on non-master pages ----------
-    var IS_MASTER = (window.location.pathname === '/master');
-    if (!IS_MASTER) {
-      document.getElementById('postboardBar').style.display = 'none';
-      document.getElementById('postboardPanel').classList.remove('visible');
-      document.getElementById('postboardPanel').style.display = 'none';
-    }
-
     var socket = null;
     var terminal = document.getElementById('terminal');
     var input = document.getElementById('cmd');
@@ -323,11 +262,9 @@ const indexHtml = `<!DOCTYPE html>
     var commandHistory = [];
     var historyIndex = -1;
     var lastCtrlClickedCheckbox = null;
-    // File transfer state
     var downloadMeta = null;
     var pendingDownloadChunks = {};
 
-    // ---------- mode toggle ----------
     document.querySelectorAll('input[name="selMode"]').forEach(function(radio) {
       radio.addEventListener('change', function(e) {
         if (!e.target.checked) return;
@@ -344,9 +281,8 @@ const indexHtml = `<!DOCTYPE html>
 
     function updateSelectedList() {
       var el = document.getElementById('selectedList');
-      if (selectionMode === 'none') {
-        el.textContent = 'Mode: None — all clients targeted via normal input';
-      } else if (selectionMode === 'include') {
+      if (selectionMode === 'none') el.textContent = 'Mode: None — all clients targeted via normal input';
+      else if (selectionMode === 'include') {
         if (selectedUUIDs.size === 0) el.textContent = 'Selected (include): none — command will go nowhere';
         else el.textContent = 'Selected (include): ' + Array.from(selectedUUIDs).join(', ');
       } else {
@@ -444,90 +380,6 @@ const indexHtml = `<!DOCTYPE html>
       document.getElementById('fileProgress').style.display = 'none';
     }
 
-    // ==================== POSTBOARD CLIENT LOGIC ====================
-    function escapeHtml(s) {
-      return String(s).replace(/[&<>"']/g, function(c) {
-        return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
-      });
-    }
-
-    function renderSubmissions(list) {
-      var el = document.getElementById('postboardList');
-      var countEl = document.getElementById('postboardCount');
-      el.innerHTML = '';
-      countEl.textContent = (list ? list.length : 0) + ' submission' + ((list && list.length === 1) ? '' : 's');
-      if (!list || list.length === 0) {
-        var empty = document.createElement('div');
-        empty.className = 'submission-empty';
-        empty.textContent = 'No submissions found.';
-        el.appendChild(empty);
-        return;
-      }
-      var shown = list.slice(0, 100);
-      shown.forEach(function(s) {
-        var item = document.createElement('div');
-        item.className = 'submission-item';
-
-        var header = document.createElement('div');
-        header.className = 'submission-header';
-        var ts = new Date(s.timestamp).toLocaleString();
-        header.textContent = '[' + s.uuid + '] ' + (s.filename || '(no name)') +
-                            ' — ' + ts + ' (' + s.size + ' bytes)';
-
-        var body = document.createElement('pre');
-        body.className = 'submission-body';
-        var content = s.content || '';
-        if (content.length > 2000) content = content.substring(0, 2000) + '\\n... [truncated]';
-        body.textContent = content;
-
-        item.appendChild(header);
-        item.appendChild(body);
-        el.appendChild(item);
-      });
-      if (list.length > shown.length) {
-        var more = document.createElement('div');
-        more.className = 'submission-empty';
-        more.textContent = '... ' + (list.length - shown.length) + ' more not shown';
-        el.appendChild(more);
-      }
-    }
-
-    function fetchSubmissions(showPanel) {
-      if (!IS_MASTER) return;
-      var uuidInput = document.getElementById('postboardSearch');
-      var uuid = uuidInput.value.trim();
-      var url = uuid ? '/submissions?uuid=' + encodeURIComponent(uuid) : '/submissions';
-      fetch(url).then(function(r) { return r.json(); }).then(function(data) {
-        renderSubmissions(Array.isArray(data) ? data : []);
-        if (showPanel) {
-          document.getElementById('postboardPanel').classList.add('visible');
-          document.getElementById('postboardToggleBtn').textContent = 'Hide Postboard';
-        }
-      }).catch(function(err) {
-        appendLine('[System] Postboard fetch error: ' + err.message, 'error');
-      });
-    }
-
-    if (IS_MASTER) {
-      var searchInput = document.getElementById('postboardSearch');
-      searchInput.addEventListener('keydown', function(e) {
-        if (e.key === 'Enter') fetchSubmissions(true);
-        if (e.key === 'Escape') { searchInput.value = ''; fetchSubmissions(true); }
-      });
-      document.getElementById('postboardSearchBtn').addEventListener('click', function() {
-        fetchSubmissions(true);
-      });
-      document.getElementById('postboardToggleBtn').addEventListener('click', function() {
-        var panel = document.getElementById('postboardPanel');
-        var nowVisible = panel.classList.toggle('visible');
-        this.textContent = nowVisible ? 'Hide Postboard' : 'Show Postboard';
-        if (nowVisible) fetchSubmissions(false);
-      });
-      // initial load
-      fetchSubmissions(false);
-    }
-
-    // ---------- socket setup ----------
     socket = io({
       reconnection: true,
       reconnectionDelay: 1000,
@@ -542,9 +394,7 @@ const indexHtml = `<!DOCTYPE html>
         socket.emit('register-master');
       } else {
         var uuid = (pathName || '/').substring(1);
-        if (uuid && uuid !== '') {
-          socket.emit('register-viewer', uuid);
-        }
+        if (uuid && uuid !== '') socket.emit('register-viewer', uuid);
       }
     });
 
@@ -563,17 +413,6 @@ const indexHtml = `<!DOCTYPE html>
       appendLine('[System] Registered with ID: ' + id, 'system');
     });
 
-    // ---------- live submissions ----------
-    socket.on('new-submission', function(s) {
-      appendLine('[System] New submission from ' + s.uuid +
-                 ' (' + (s.filename || 'no name') + ', ' + s.size + ' bytes)', 'system');
-      if (IS_MASTER && document.getElementById('postboardPanel').classList.contains('visible')) {
-        var currentSearch = document.getElementById('postboardSearch').value.trim();
-        if (!currentSearch || currentSearch === s.uuid) fetchSubmissions(false);
-      }
-    });
-
-    // ---------- file download events ----------
     socket.on('download-start', function(meta) {
       downloadMeta = meta;
       pendingDownloadChunks = {};
@@ -624,7 +463,6 @@ const indexHtml = `<!DOCTYPE html>
       pendingDownloadChunks = {};
     });
 
-    // ---------- upload events ----------
     socket.on('upload-complete', function(data) {
       hideProgress();
       appendLine('[System] Uploaded "' + data.name + '" to client(s) (' + data.size + ' bytes)', 'system');
@@ -637,16 +475,14 @@ const indexHtml = `<!DOCTYPE html>
       showProgress('Uploading: ' + data.name, data.pct);
     });
 
-    // ---------- command input ----------
     input.addEventListener('keydown', function(evt) {
       if (!socket || !socket.connected) return;
       if (evt.key === 'Enter') {
         var val = input.value.trim();
         if (val) {
           var targets = getTargetUUIDs();
-          if (targets === null) {
-            socket.emit('command', val);
-          } else if (targets.size > 0) {
+          if (targets === null) socket.emit('command', val);
+          else if (targets.size > 0) {
             socket.emit('targeted-command', { uuids: Array.from(targets), cmd: val });
             appendLine('[System] Sent targeted command to ' + targets.size + ' client(s): ' + val, 'system');
           } else {
@@ -682,7 +518,6 @@ const indexHtml = `<!DOCTYPE html>
       updateSelectedList();
     });
 
-    // ---------- upload handler ----------
     document.getElementById('uploadBtn').addEventListener('click', function() {
       var fileInput = document.getElementById('uploadFileInput');
       if (!fileInput.files || fileInput.files.length === 0) {
@@ -727,7 +562,6 @@ const indexHtml = `<!DOCTYPE html>
       reader.readAsDataURL(file);
     });
 
-    // ---------- download handler ----------
     document.getElementById('downloadBtn').addEventListener('click', function() {
       var remotePath = document.getElementById('downloadPath').value.trim();
       if (!remotePath) {
@@ -747,7 +581,6 @@ const indexHtml = `<!DOCTYPE html>
       }
     });
 
-    // initial state
     document.querySelectorAll('.lineCheckbox').forEach(function(cb) { cb.disabled = true; });
     updateSelectedList();
   </script>
@@ -757,16 +590,392 @@ const indexHtml = `<!DOCTYPE html>
 fs.writeFileSync(path.join(publicDir, 'index.html'), indexHtml);
 
 // =====================================================
+// ============ public-server/postboard.html ===========
+// =====================================================
+const postboardHtml = `<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Postboard</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body {
+      height: 100%;
+      background: #121212;
+      color: #eee;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+      font-size: 14px;
+    }
+    body { display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
+
+    header {
+      flex: 0 0 auto;
+      background: #1a1a1a;
+      border-bottom: 1px solid #2a2a2a;
+      padding: 12px 20px;
+      display: flex;
+      gap: 12px;
+      align-items: center;
+    }
+    header h1 {
+      font-size: 16px;
+      font-weight: 600;
+      color: #5f5;
+      margin-right: 8px;
+      white-space: nowrap;
+    }
+    header input {
+      flex: 1;
+      max-width: 500px;
+      background: #0a0a0a;
+      border: 1px solid #2a2a2a;
+      color: #eee;
+      padding: 8px 12px;
+      border-radius: 4px;
+      font-size: 13px;
+      font-family: 'Courier New', monospace;
+    }
+    header input:focus {
+      outline: none;
+      border-color: #0f08;
+    }
+    header button {
+      background: #2a2a2a;
+      color: #eee;
+      border: 1px solid #333;
+      padding: 8px 12px;
+      border-radius: 4px;
+      cursor: pointer;
+      font-size: 12px;
+    }
+    header button:hover { background: #3a3a3a; }
+    #status {
+      color: #888;
+      font-size: 11px;
+      white-space: nowrap;
+    }
+
+    #main {
+      flex: 1 1 auto;
+      display: flex;
+      min-height: 0;
+      overflow: hidden;
+    }
+
+    aside {
+      flex: 0 0 280px;
+      background: #161616;
+      border-right: 1px solid #2a2a2a;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+    aside .sidebar-header {
+      padding: 10px 15px;
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 1px;
+      color: #888;
+      border-bottom: 1px solid #2a2a2a;
+      flex: 0 0 auto;
+    }
+    #uuidList {
+      flex: 1 1 auto;
+      overflow-y: auto;
+      padding: 6px 0;
+    }
+    .uuid-item {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 15px;
+      cursor: pointer;
+      color: #ccc;
+      font-size: 12px;
+      border: none;
+      background: none;
+      width: 100%;
+      text-align: left;
+      font-family: 'Courier New', monospace;
+    }
+    .uuid-item:hover { background: #1f1f1f; }
+    .uuid-item.active { background: #0f02; color: #5f5; border-left: 3px solid #0f0; padding-left: 12px; }
+    .uuid-item .uuid-label {
+      flex: 1 1 auto;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .uuid-item .count {
+      flex: 0 0 auto;
+      background: #2a2a2a;
+      color: #aaa;
+      font-size: 10px;
+      padding: 1px 6px;
+      border-radius: 10px;
+    }
+    .uuid-item.active .count { background: #0f03; color: #5f5; }
+    .uuid-item .online-dot {
+      display: inline-block;
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: #5f5;
+      margin-right: 4px;
+      vertical-align: middle;
+    }
+
+    main {
+      flex: 1 1 auto;
+      overflow-y: auto;
+      padding: 16px 20px;
+      min-height: 0;
+    }
+
+    .submission {
+      background: #0d0d0d;
+      border: 1px solid #2a2a2a;
+      border-radius: 6px;
+      margin-bottom: 12px;
+      overflow: hidden;
+    }
+    .submission-header {
+      background: #161616;
+      padding: 8px 12px;
+      border-bottom: 1px solid #2a2a2a;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+      font-size: 11px;
+      flex-wrap: wrap;
+    }
+    .submission-uuid {
+      color: #5f5;
+      font-family: 'Courier New', monospace;
+      cursor: pointer;
+    }
+    .submission-uuid:hover { text-decoration: underline; }
+    .submission-filename {
+      color: #eee;
+      font-weight: 600;
+    }
+    .submission-meta {
+      color: #888;
+      font-size: 10px;
+      display: flex;
+      gap: 12px;
+    }
+    .submission-body {
+      padding: 10px 12px;
+      font-family: 'Courier New', monospace;
+      font-size: 12px;
+      white-space: pre-wrap;
+      word-break: break-all;
+      color: #ddd;
+      max-height: 300px;
+      overflow-y: auto;
+      background: #080808;
+    }
+
+    .empty-state {
+      text-align: center;
+      padding: 60px 20px;
+      color: #555;
+      font-size: 13px;
+    }
+
+    ::-webkit-scrollbar { width: 8px; height: 8px; }
+    ::-webkit-scrollbar-track { background: #0a0a0a; }
+    ::-webkit-scrollbar-thumb { background: #333; border-radius: 4px; }
+    ::-webkit-scrollbar-thumb:hover { background: #555; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Postboard</h1>
+    <input id="searchInput" type="text" placeholder="Search by UUID, filename, or content..." autocomplete="off" spellcheck="false" />
+    <button id="refreshBtn">Refresh</button>
+    <span id="status">Loading...</span>
+  </header>
+  <div id="main">
+    <aside>
+      <div class="sidebar-header">Seen Clients</div>
+      <div id="uuidList">
+        <button class="uuid-item active" data-uuid=""><span class="uuid-label">All submissions</span><span class="count" id="allCount">0</span></button>
+      </div>
+    </aside>
+    <main id="content">
+      <div id="submissionList">
+        <div class="empty-state">Loading…</div>
+      </div>
+    </main>
+  </div>
+  <script>
+    (function() {
+      var seenClients = [];
+      var currentUUID = '';
+      var currentSearch = '';
+      var allSubmissions = [];
+      var refreshTimer = null;
+
+      function escapeHtml(s) {
+        return String(s).replace(/[&<>"']/g, function(c) {
+          return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];
+        });
+      }
+
+      function formatTime(ts) {
+        var now = Date.now();
+        var diff = now - ts;
+        if (diff < 60000) return Math.floor(diff/1000) + 's ago';
+        if (diff < 3600000) return Math.floor(diff/60000) + 'm ago';
+        if (diff < 86400000) return Math.floor(diff/3600000) + 'h ago';
+        return new Date(ts).toLocaleString();
+      }
+
+      function renderSidebar() {
+        var list = document.getElementById('uuidList');
+        document.getElementById('allCount').textContent = allSubmissions.length;
+
+        var existing = {};
+        Array.from(list.querySelectorAll('.uuid-item')).forEach(function(el) {
+          if (el.dataset.uuid) existing[el.dataset.uuid] = el;
+        });
+
+        seenClients.forEach(function(c) {
+          var el = existing[c.uuid];
+          if (!el) {
+            el = document.createElement('button');
+            el.className = 'uuid-item';
+            el.dataset.uuid = c.uuid;
+            el.addEventListener('click', function() { selectUUID(c.uuid); });
+            list.appendChild(el);
+          }
+          delete existing[c.uuid];
+
+          var onlineDot = c.online ? '<span class="online-dot"></span>' : '';
+          el.innerHTML =
+            '<span class="uuid-label">' + onlineDot + escapeHtml(c.uuid) + '</span>' +
+            '<span class="count">' + c.submissionCount + '</span>';
+          el.classList.toggle('active', currentUUID === c.uuid);
+        });
+
+        Object.keys(existing).forEach(function(k) { existing[k].remove(); });
+
+        var allBtn = list.querySelector('.uuid-item[data-uuid=""]');
+        if (allBtn) allBtn.classList.toggle('active', currentUUID === '');
+      }
+
+      function selectUUID(uuid) {
+        currentUUID = uuid;
+        renderSidebar();
+        renderSubmissions();
+      }
+
+      function filterSubmissions() {
+        var q = currentSearch.toLowerCase();
+        var base = currentUUID
+          ? allSubmissions.filter(function(s) { return s.uuid === currentUUID; })
+          : allSubmissions;
+        if (!q) return base;
+        return base.filter(function(s) {
+          return s.uuid.toLowerCase().indexOf(q) !== -1 ||
+                 (s.filename || '').toLowerCase().indexOf(q) !== -1 ||
+                 (s.content || '').toLowerCase().indexOf(q) !== -1;
+        });
+      }
+
+      function renderSubmissions() {
+        var list = document.getElementById('submissionList');
+        var items = filterSubmissions();
+
+        if (items.length === 0) {
+          list.innerHTML = '<div class="empty-state">' +
+            (currentSearch ? 'No submissions match "' + escapeHtml(currentSearch) + '"' :
+             currentUUID ? 'No submissions from this client yet' :
+             'No submissions yet') + '</div>';
+          return;
+        }
+
+        var html = '';
+        items.forEach(function(s) {
+          var content = s.content || '';
+          var truncated = content.length > 5000;
+          var shown = truncated ? content.substring(0, 5000) + '\\n... [truncated]' : content;
+
+          html += '<div class="submission">';
+          html += '<div class="submission-header">';
+          html += '<div>';
+          html += '<span class="submission-filename">' + escapeHtml(s.filename || '(no name)') + '</span>';
+          html += ' <span class="submission-uuid" data-uuid="' + escapeHtml(s.uuid) + '" title="Click to filter by this UUID">[' + escapeHtml(s.uuid) + ']</span>';
+          html += '</div>';
+          html += '<div class="submission-meta">';
+          html += '<span>' + s.size + ' bytes</span>';
+          html += '<span>' + formatTime(s.timestamp) + '</span>';
+          html += '</div>';
+          html += '</div>';
+          html += '<div class="submission-body">' + escapeHtml(shown) + '</div>';
+          html += '</div>';
+        });
+        list.innerHTML = html;
+
+        list.querySelectorAll('.submission-uuid').forEach(function(el) {
+          el.addEventListener('click', function() {
+            selectUUID(el.dataset.uuid);
+          });
+        });
+      }
+
+      function fetchAll() {
+        document.getElementById('status').textContent = 'Loading...';
+        Promise.all([
+          fetch('/api/seen').then(function(r) { return r.json(); }),
+          fetch('/submissions').then(function(r) { return r.json(); })
+        ]).then(function(results) {
+          seenClients = Array.isArray(results[0]) ? results[0] : [];
+          allSubmissions = Array.isArray(results[1]) ? results[1] : [];
+          allSubmissions.sort(function(a, b) { return b.timestamp - a.timestamp; });
+
+          renderSidebar();
+          renderSubmissions();
+          document.getElementById('status').textContent =
+            allSubmissions.length + ' submissions · ' + seenClients.length + ' clients';
+        }).catch(function(err) {
+          document.getElementById('status').textContent = 'Error: ' + err.message;
+        });
+      }
+
+      var searchInput = document.getElementById('searchInput');
+      searchInput.addEventListener('input', function() {
+        currentSearch = searchInput.value.trim();
+        renderSubmissions();
+      });
+
+      document.getElementById('refreshBtn').addEventListener('click', fetchAll);
+
+      fetchAll();
+      refreshTimer = setInterval(function() {
+        if (document.visibilityState === 'visible') fetchAll();
+      }, 5000);
+    })();
+  </script>
+</body>
+</html>`;
+
+fs.writeFileSync(path.join(publicDir, 'postboard.html'), postboardHtml);
+
+// =====================================================
 // ================= POSTBOARD ROUTES ==================
 // =====================================================
 
-// POST /submission — main endpoint for send.js
 app.post('/submission', (req, res) => {
   var body = req.body;
   var uuid, content, filename;
 
   if (typeof body === 'string') {
-    // text/plain body — uuid from query or header
     uuid = (req.query.uuid || req.headers['x-client-uuid'] || '').toString().trim();
     content = body;
     filename = (req.query.filename || '').toString() || null;
@@ -800,12 +1009,7 @@ app.post('/submission', (req, res) => {
 
   submissions.push(submission);
   saveSubmissions();
-
-  // Notify the submitting client's viewers
-  var vset = viewers.get(uuid);
-  if (vset) vset.forEach(function(s) { s.emit('new-submission', submission); });
-  // Notify masters
-  masters.forEach(function(ms) { ms.emit('new-submission', submission); });
+  markUUIDSeen(uuid);
 
   console.log('[Postboard] Submission #' + submission.id + ' from ' + uuid +
               ' (' + (filename || 'no name') + ', ' + submission.size + ' bytes)');
@@ -813,23 +1017,21 @@ app.post('/submission', (req, res) => {
   res.json({ success: true, id: submission.id, size: submission.size });
 });
 
-// GET /submission — usage info
 app.get('/submission', (req, res) => {
   res.type('text/plain').send(
-    'Remote Terminal — Postboard submission endpoint\n' +
-    '\n' +
-    'POST application/json:\n' +
-    '  { "uuid": "<uuid>", "content": "<text>", "filename": "<optional>" }\n' +
-    '\n' +
-    'POST text/plain:\n' +
-    '  body = raw text; uuid from ?uuid=<uuid> or X-Client-UUID header\n' +
-    '\n' +
-    'Example (from the client directory):\n' +
-    '  node send.js https://your-server/submission myfile.txt\n'
+    'Remote Terminal — Postboard submission endpoint\\n' +
+    '\\n' +
+    'POST application/json:\\n' +
+    '  { "uuid": "<uuid>", "content": "<text>", "filename": "<optional>" }\\n' +
+    '\\n' +
+    'POST text/plain:\\n' +
+    '  body = raw text; uuid from ?uuid=<uuid> or X-Client-UUID header\\n' +
+    '\\n' +
+    'Example (from the client directory):\\n' +
+    '  node send.js https://your-server/submission myfile.txt\\n'
   );
 });
 
-// GET /submissions — list / filter by uuid
 app.get('/submissions', (req, res) => {
   var uuid = (req.query.uuid || '').toString().trim();
   var result = uuid ? submissions.filter(function(s) { return s.uuid === uuid; }) : submissions.slice();
@@ -839,24 +1041,43 @@ app.get('/submissions', (req, res) => {
   res.json(result);
 });
 
+// Seen UUIDs, with live counts + online state
+app.get('/api/seen', (req, res) => {
+  var counts = new Map();
+  submissions.forEach(function(s) { counts.set(s.uuid, (counts.get(s.uuid) || 0) + 1); });
+
+  var list = seenUUIDs.map(function(s) {
+    var c = clients.get(s.uuid);
+    return {
+      uuid: s.uuid,
+      firstSeen: s.firstSeen,
+      lastSeen: s.lastSeen,
+      submissionCount: counts.get(s.uuid) || 0,
+      online: !!(c && c.socket && c.socket.connected)
+    };
+  });
+  list.sort(function(a, b) { return b.lastSeen - a.lastSeen; });
+  res.json(list);
+});
+
 // =====================================================
 // ==================== PAGE ROUTES ====================
 // =====================================================
 
-app.get('/', (req, res) => {
-  res.type('text/plain').send(
-    'Remote Terminal Server\n\n' +
-    'Master:  /master\n' +
-    'Viewer:  /<client-uuid>\n' +
-    'Post:    POST /submission\n' +
-    'List:    GET /submissions?uuid=<uuid>\n'
-  );
-});
+// Root intentionally disabled — blank 404
+app.get('/', (req, res) => res.status(404).end());
+
+app.get('/favicon.ico', (req, res) => res.status(204).end());
 
 app.get('/master', (req, res) => {
   res.sendFile(path.join(publicDir, 'index.html'));
 });
 
+app.get('/postboard', (req, res) => {
+  res.sendFile(path.join(publicDir, 'postboard.html'));
+});
+
+// Catch-all must come last
 app.get('/:uuid', (req, res) => {
   res.sendFile(path.join(publicDir, 'index.html'));
 });
@@ -869,7 +1090,6 @@ io.on('connection', (socket) => {
   let role = null;
   let clientId = null;
 
-  // heartbeat from client
   socket.on('heartbeat', () => {
     if (clientId && clientHeartbeats.has(clientId)) {
       clientHeartbeats.set(clientId, Date.now());
@@ -881,7 +1101,6 @@ io.on('connection', (socket) => {
     role = 'client';
     const connectionEpoch = Date.now();
 
-    // Accept BOTH: a string (legacy) OR { clientId, epoch } (current client)
     let oldId = null;
     if (typeof payload === 'string') {
       oldId = payload;
@@ -891,7 +1110,6 @@ io.on('connection', (socket) => {
         : null;
     }
 
-    // Validate UUID-ish string (8-128 chars, alnum + dash/underscore)
     const validOldId = (typeof oldId === 'string' && /^[A-Za-z0-9_-]{8,128}$/.test(oldId))
       ? oldId
       : null;
@@ -899,7 +1117,6 @@ io.on('connection', (socket) => {
     if (validOldId) {
       const existing = clients.get(validOldId);
       if (existing && existing.socket && existing.socket.connected) {
-        // Reconnect with a UUID that's currently connected — reuse it
         clientId = validOldId;
         existing.socket = socket;
         existing.epoch = connectionEpoch;
@@ -908,7 +1125,6 @@ io.on('connection', (socket) => {
           : process.cwd());
         console.log(`Client reconnected with existing UUID: ${clientId}`);
       } else {
-        // Server may have restarted, OR stale entry — accept saved UUID as permanent
         clientId = validOldId;
         clients.set(clientId, {
           socket: socket,
@@ -922,7 +1138,6 @@ io.on('connection', (socket) => {
       }
       socket.emit('registered', clientId);
     } else {
-      // First run (no saved UUID) — generate a new one
       clientId = uuidv4();
       clients.set(clientId, {
         socket: socket,
@@ -936,12 +1151,14 @@ io.on('connection', (socket) => {
       socket.emit('registered', clientId);
     }
 
+    // Record in seen list
+    markUUIDSeen(clientId);
+
     clientHeartbeats.set(clientId, Date.now());
 
     const clientData = clients.get(clientId);
     socket.emit('directory', clientData.cwd);
 
-    // ---------- disconnection ----------
     socket.on('disconnect', () => {
       const current = clients.get(clientId);
       if (!current || current.epoch !== connectionEpoch) return;
@@ -962,7 +1179,6 @@ io.on('connection', (socket) => {
       }, 60000);
     });
 
-    // ---------- output / error / system / directory ----------
     socket.on('output', (data) => {
       const set = viewers.get(clientId);
       if (set) set.forEach(s => s.emit('output', `[${clientId}] ${data}`));
@@ -975,7 +1191,6 @@ io.on('connection', (socket) => {
       masters.forEach(ms => ms.emit('error', `[${clientId}] ${data}`));
     });
 
-    // Forward client "system" messages (previously dropped)
     socket.on('system', (data) => {
       const set = viewers.get(clientId);
       if (set) set.forEach(s => s.emit('system', `[${clientId}] ${data}`));
@@ -984,7 +1199,7 @@ io.on('connection', (socket) => {
 
     socket.on('directory', (dir) => {
       const cd = clients.get(clientId);
-      if (cd) cd.cwd = dir;                 // keep server-side cwd accurate
+      if (cd) cd.cwd = dir;
       const set = viewers.get(clientId);
       if (set) set.forEach(s => s.emit('directory', dir));
       masters.forEach(ms => ms.emit('system', `[${clientId}] Directory changed to: ${dir}`));
@@ -994,7 +1209,6 @@ io.on('connection', (socket) => {
       socket.emit('command', cmd);
     });
 
-    // ---------- file download events FROM client ----------
     socket.on('file-download-start', (meta) => {
       const set = viewers.get(clientId);
       if (set) set.forEach(s => s.emit('download-start', meta));
@@ -1061,12 +1275,10 @@ io.on('connection', (socket) => {
       }
     });
 
-    // viewer upload
     socket.on('upload-start', (meta) => { clientData.socket.emit('file-upload-start', meta); });
     socket.on('upload-chunk', (data) => { clientData.socket.emit('file-upload-chunk', data); });
     socket.on('upload-end', (data) => { clientData.socket.emit('file-upload-end', data); });
 
-    // viewer download
     socket.on('download-request', (data) => {
       clientData.socket.emit('file-download-request', { path: data.path });
     });
@@ -1089,7 +1301,6 @@ io.on('connection', (socket) => {
       console.log('Master terminal disconnected');
     });
 
-    // master upload (include/exclude aware)
     socket.on('upload-start', (meta) => {
       if (meta.targets === null) {
         clients.forEach((client) => client.socket.emit('file-upload-start', meta));
@@ -1129,7 +1340,6 @@ io.on('connection', (socket) => {
       }
     });
 
-    // master download
     socket.on('download-request', (data) => {
       if (data.targets === null || data.targets.length === 0) {
         const firstEntry = clients.entries().next().value;
@@ -1189,10 +1399,15 @@ setInterval(() => {
   }
 }, 30000);
 
+// Flush seen UUIDs on shutdown
+process.on('SIGINT', () => { try { saveSeenUUIDs(); } catch {} process.exit(0); });
+process.on('SIGTERM', () => { try { saveSeenUUIDs(); } catch {} process.exit(0); });
+
 const PORT = process.env.PORT || 8080;
 server.listen(PORT, () => {
   console.log(`Server listening on http://localhost:${PORT}`);
-  console.log(`  Master:  http://localhost:${PORT}/master`);
-  console.log(`  Viewer:  http://localhost:${PORT}/<uuid>`);
-  console.log(`  Submit:  POST http://localhost:${PORT}/submission`);
+  console.log(`  Master:     http://localhost:${PORT}/master`);
+  console.log(`  Postboard:  http://localhost:${PORT}/postboard`);
+  console.log(`  Viewer:     http://localhost:${PORT}/<uuid>`);
+  console.log(`  Submit:     POST http://localhost:${PORT}/submission`);
 });
